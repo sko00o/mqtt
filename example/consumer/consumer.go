@@ -11,9 +11,9 @@ import (
 )
 
 const (
-	mqttURL  = "mqtt://logs:logs123@192.168.20.47:1883"
-	clientID = "test_client"
-	topic    = "test_topic"
+	mqttURL  = "mqtt://usr:pwd@localhost:1883"
+	clientID = "test_consumer"
+	topic    = "test/topic"
 )
 
 func main() {
