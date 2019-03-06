@@ -34,6 +34,7 @@ func main() {
 			log.Infof("receive: %s", msg)
 		},
 	)
+	defer bkd.Disconnect()
 
 	sig := make(chan os.Signal)
 	signal.Notify(sig, os.Interrupt)

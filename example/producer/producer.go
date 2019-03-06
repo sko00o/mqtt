@@ -27,6 +27,7 @@ func main() {
 	if err := bkd.Connect(); err != nil {
 		log.Fatal(err)
 	}
+	defer bkd.Disconnect()
 
 	sig := make(chan os.Signal)
 	signal.Notify(sig, os.Interrupt)
@@ -35,10 +36,12 @@ func main() {
 		select {
 		case <-sig:
 			return
-		case <-time.After(time.Second * 2):
-			msg := time.Now().String()
+		case curTime := <-time.After(time.Second * 2):
+			msg := curTime.String()
 			log.Infoln("send: ", msg)
-			bkd.Publish(*tpc, 2, true, []byte(msg))
+			if err := bkd.Publish(*tpc, 2, true, []byte(msg)); err != nil {
+				log.Error("publish failed:", err)
+			}
 		}
 	}
 

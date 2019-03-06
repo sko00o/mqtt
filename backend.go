@@ -2,6 +2,7 @@ package mqtt
 
 import (
 	"net/url"
+	"time"
 
 	mqtt "github.com/eclipse/paho.mqtt.golang"
 	"github.com/sirupsen/logrus"
@@ -17,9 +18,15 @@ type Mqtt interface {
 
 var logMqtt = logrus.WithField("logger", "tools/mqtt")
 
+type sub struct {
+	filters map[string]byte
+	handle  func(message []byte)
+}
+
 type mqttImpl struct {
 	url    string
 	client mqtt.Client
+	tasks  []sub
 }
 
 func NewMqttBroker(rawURL string, clientID string) Mqtt {
@@ -28,26 +35,43 @@ func NewMqttBroker(rawURL string, clientID string) Mqtt {
 		panic(err)
 	}
 
-	return &mqttImpl{
-		url:    url.Host,
-		client: client(url, clientID),
+	m := &mqttImpl{
+		url:   url.Host,
+		tasks: make([]sub, 0),
 	}
+
+	m.client = client(url, clientID, m)
+
+	return m
 }
 
-func client(url *url.URL, clientID string) mqtt.Client {
-
+func client(url *url.URL, clientID string, m *mqttImpl) mqtt.Client {
 	connOpts := mqtt.NewClientOptions().
 		AddBroker("tcp://" + url.Host).
 		SetClientID(clientID).
 		SetUsername(url.User.Username()).
-		SetOnConnectHandler(func(client mqtt.Client) {
-			logMqtt.WithFields(logrus.Fields{
-				"broker":   url.Host,
-				"ClientID": clientID,
-			}).Info("mqtt connected")
-		}).
 		SetConnectionLostHandler(func(client mqtt.Client, reason error) {
 			logMqtt.WithError(reason).Warn("mqtt connection lost")
+		}).
+		SetOnConnectHandler(func(client mqtt.Client) {
+			logger := logMqtt.WithFields(logrus.Fields{
+				"broker":   url.Host,
+				"ClientID": clientID,
+			})
+			logger.Info("mqtt connected")
+			for _, task := range m.tasks {
+				filters, handle := task.filters, task.handle
+				for {
+					if t := client.SubscribeMultiple(filters, func(client mqtt.Client, msg mqtt.Message) {
+						handle(msg.Payload())
+					}); t.Wait() && t.Error() != nil {
+						logger.Error("subscribe error", t.Error(), ",will retry in 2s")
+						time.Sleep(2 * time.Second)
+					} else {
+						break
+					}
+				}
+			}
 		})
 	if password, isSet := url.User.Password(); isSet {
 		connOpts = connOpts.SetPassword(password)
@@ -92,6 +116,8 @@ func (m *mqttImpl) Handle(topics []string, handle func(message []byte)) error {
 	}); t.Wait() && t.Error() != nil {
 		return t.Error()
 	}
+
+	m.tasks = append(m.tasks, sub{filters, handle})
 
 	return nil
 }
