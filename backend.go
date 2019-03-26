@@ -1,10 +1,10 @@
 package mqtt
 
 import (
-	"net/url"
+	"fmt"
 	"time"
 
-	mqtt "github.com/eclipse/paho.mqtt.golang"
+	"github.com/eclipse/paho.mqtt.golang"
 	"github.com/sirupsen/logrus"
 )
 
@@ -15,6 +15,11 @@ type Mqtt interface {
 	Publish(topic string, qos byte, retailed bool, message []byte) error
 	GetAddress() string
 }
+
+const (
+	waitTimeout   = 5 * time.Second
+	retryInterval = 2 * time.Second
+)
 
 var logMqtt = logrus.WithField("logger", "tools/mqtt")
 
@@ -29,53 +34,39 @@ type mqttImpl struct {
 	tasks  []sub
 }
 
-func NewMqttBroker(rawURL string, clientID string) Mqtt {
-	url, err := url.Parse(rawURL)
-	if err != nil {
-		panic(err)
-	}
+type ConnInfo struct {
+	Host     string
+	Username string
+	Password string
+}
 
+func MQTTBroker(c *ConnInfo, clientID string) Mqtt {
 	m := &mqttImpl{
-		url:   url.Host,
 		tasks: make([]sub, 0),
 	}
 
-	m.client = client(url, clientID, m)
+	m.client = client(c, clientID, m)
 
 	return m
 }
 
-func client(url *url.URL, clientID string, m *mqttImpl) mqtt.Client {
+func client(c *ConnInfo, clientID string, m *mqttImpl) mqtt.Client {
 	connOpts := mqtt.NewClientOptions().
-		AddBroker("tcp://" + url.Host).
+		AddBroker(c.Host). // can be url schema here, e.g tcp://usr:pwd@mqtt.domain:1883
 		SetClientID(clientID).
-		SetUsername(url.User.Username()).
+		SetUsername(c.Username).SetPassword(c.Password).
 		SetConnectionLostHandler(func(client mqtt.Client, reason error) {
 			logMqtt.WithError(reason).Warn("mqtt connection lost")
 		}).
 		SetOnConnectHandler(func(client mqtt.Client) {
 			logger := logMqtt.WithFields(logrus.Fields{
-				"broker":   url.Host,
+				"broker":   c.Host,
 				"ClientID": clientID,
 			})
 			logger.Info("mqtt connected")
-			for _, task := range m.tasks {
-				filters, handle := task.filters, task.handle
-				for {
-					if t := client.SubscribeMultiple(filters, func(client mqtt.Client, msg mqtt.Message) {
-						handle(msg.Payload())
-					}); t.Wait() && t.Error() != nil {
-						logger.Error("subscribe error", t.Error(), ",will retry in 2s")
-						time.Sleep(2 * time.Second)
-					} else {
-						break
-					}
-				}
-			}
+
+			subscribeLoop(client, m.tasks...)
 		})
-	if password, isSet := url.User.Password(); isSet {
-		connOpts = connOpts.SetPassword(password)
-	}
 
 	client := mqtt.NewClient(connOpts)
 	return client
@@ -86,10 +77,22 @@ func (m *mqttImpl) GetAddress() string {
 }
 
 func (m *mqttImpl) Connect() error {
-	if t := m.client.Connect(); t.Wait() && t.Error() != nil {
+	/*if t := m.client.Connect(); t.Wait() && t.Error() != nil {
 		return t.Error()
-	}
+	}*/
+	connectLoop(m.client)
 	return nil
+}
+
+func connectLoop(client mqtt.Client) {
+	for {
+		if t := client.Connect(); t.WaitTimeout(waitTimeout) && t.Error() != nil {
+			logMqtt.Warnf("connect error: %s, will retry in %s", t.Error(), retryInterval)
+			time.Sleep(retryInterval)
+			continue
+		}
+		return
+	}
 }
 
 func (m *mqttImpl) Disconnect() {
@@ -107,18 +110,51 @@ func (m *mqttImpl) Handle(topics []string, handle func(message []byte)) error {
 	}
 
 	if len(filters) == 0 {
-		logMqtt.Warn("no topics")
-		return nil
+		return fmt.Errorf("no topics")
 	}
 
-	if t := m.client.SubscribeMultiple(filters, func(client mqtt.Client, msg mqtt.Message) {
-		handle(msg.Payload())
-	}); t.Wait() && t.Error() != nil {
-		return t.Error()
+	task := sub{filters, handle}
+
+	subscribeLoop(m.client, task)
+
+	m.tasks = append(m.tasks, task)
+
+	return nil
+}
+
+func subscribeLoop(client mqtt.Client, tasks ...sub) {
+	for _, task := range tasks {
+		filters, handle := task.filters, task.handle
+		for {
+			t := client.SubscribeMultiple(filters, func(client mqtt.Client, msg mqtt.Message) {
+				handle(msg.Payload())
+			})
+			if t.WaitTimeout(waitTimeout) && t.Error() != nil {
+				logMqtt.WithField("topics", filters).
+					Warnf("subscribe error: %s, will retry in %s", t.Error(), retryInterval)
+				time.Sleep(retryInterval)
+				continue
+			}
+			if err := qosCheck(t.(*mqtt.SubscribeToken).Result()); err != nil {
+				logMqtt.WithField("topics", filters).
+					Warnf("subscribe error: %s, will retry in %s", err, retryInterval)
+				time.Sleep(retryInterval)
+				continue
+			}
+
+			logMqtt.WithField("topics", filters).
+				Info("subscribe success")
+			break
+		}
 	}
+}
 
-	m.tasks = append(m.tasks, sub{filters, handle})
-
+func qosCheck(rst map[string]byte) error {
+	for topic, qos := range rst {
+		if qos < 0 || qos > 2 {
+			return fmt.Errorf("invalid qos for topic %s", topic)
+		}
+	}
 	return nil
 }
 
